@@ -17,6 +17,10 @@ pub fn verify<MC: MerkleChannel>(
     commitment_scheme: &mut CommitmentSchemeVerifier<MC>,
     proof: StarkProof<MC::H>,
 ) -> Result<(), VerificationError> {
+    let total_start = std::time::Instant::now();
+    
+    // Setup phase
+    let phase_timer = std::time::Instant::now();
     let n_preprocessed_columns = commitment_scheme.trees[PREPROCESSED_TRACE_IDX]
         .column_log_sizes
         .len();
@@ -25,34 +29,44 @@ pub fn verify<MC: MerkleChannel>(
         components: components.to_vec(),
         n_preprocessed_columns,
     };
-    tracing::info!(
-        "Composition polynomial log degree bound: {}",
-        components.composition_log_degree_bound()
+    
+    let composition_log_degree = components.composition_log_degree_bound();
+    log::info!(
+        "Setup: Composition polynomial log degree bound: {}, duration: {:?}",
+        composition_log_degree,
+        phase_timer.elapsed()
     );
+    
     let random_coeff = channel.draw_secure_felt();
 
-    // Read composition polynomial commitment.
+    // Commitment verification phase
+    let phase_timer = std::time::Instant::now();
     commitment_scheme.commit(
         *proof.commitments.last().unwrap(),
-        &[components.composition_log_degree_bound(); SECURE_EXTENSION_DEGREE],
+        &[composition_log_degree; SECURE_EXTENSION_DEGREE],
         channel,
     );
+    log::info!("Commitment verification took: {:?}", phase_timer.elapsed());
 
-    // Draw OODS point.
+    // OODS point generation
+    let phase_timer = std::time::Instant::now();
     let oods_point = CirclePoint::<SecureField>::get_random_point(channel);
+    log::info!("OODS point generation took: {:?}", phase_timer.elapsed());
 
-    // Get mask sample points relative to oods point.
+    // Sample points computation
+    let phase_timer = std::time::Instant::now();
     let mut sample_points = components.mask_points(oods_point);
-    // Add the composition polynomial mask points.
     sample_points.push(vec![vec![oods_point]; SECURE_EXTENSION_DEGREE]);
 
     let sample_points_by_column = sample_points.as_cols_ref().flatten();
-    tracing::info!("Sampling {} columns.", sample_points_by_column.len());
-    tracing::info!(
-        "Total sample points: {}.",
-        sample_points_by_column.into_iter().flatten().count()
-    );
+    let n_columns = sample_points_by_column.len();
+    let total_sample_points = sample_points_by_column.into_iter().flatten().count();
+    
+    log::info!("Sampling {} columns with {} total sample points, took: {:?}", 
+        n_columns, total_sample_points, phase_timer.elapsed());
 
+    // OODS evaluation and verification
+    let phase_timer = std::time::Instant::now();
     let composition_oods_eval =
         proof
             .extract_composition_oods_eval()
@@ -60,17 +74,27 @@ pub fn verify<MC: MerkleChannel>(
                 std_shims::ToString::to_string(&"Unexpected sampled_values structure"),
             ))?;
 
-    if composition_oods_eval
-        != components.eval_composition_polynomial_at_point(
-            oods_point,
-            &proof.sampled_values,
-            random_coeff,
-        )
-    {
+    let expected_composition_eval = components.eval_composition_polynomial_at_point(
+        oods_point,
+        &proof.sampled_values,
+        random_coeff,
+    );
+
+    if composition_oods_eval != expected_composition_eval {
+        log::error!("OODS verification failed - values don't match");
         return Err(VerificationError::OodsNotMatching);
     }
+    
+    log::info!("OODS verification took: {:?}", phase_timer.elapsed());
 
-    commitment_scheme.verify_values(sample_points, proof.0, channel)
+    // Final verification
+    let phase_timer = std::time::Instant::now();
+    let result = commitment_scheme.verify_values(sample_points, proof.0, channel);
+    log::info!("Final verification took: {:?}, success: {}", phase_timer.elapsed(), result.is_ok());
+    
+    log::info!("Total verification time: {:?}", total_start.elapsed());
+    
+    result
 }
 
 #[derive(Clone, Debug, Error)]
