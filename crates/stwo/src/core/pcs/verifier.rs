@@ -2,6 +2,7 @@ use core::iter::zip;
 
 use itertools::Itertools;
 use std_shims::Vec;
+use log::info;  // Add this import
 
 use super::super::circle::CirclePoint;
 use super::super::fields::qm31::SecureField;
@@ -60,9 +61,17 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
         proof: CommitmentSchemeProof<MC::H>,
         channel: &mut MC::C,
     ) -> Result<(), VerificationError> {
+        let total_start = std::time::Instant::now();
+        info!("CommitmentSchemeVerifier::verify_values - Starting verification");
+        
+        // Channel mixing and random coefficient generation
+        let phase_timer = std::time::Instant::now();
         channel.mix_felts(&proof.sampled_values.clone().flatten_cols());
         let random_coeff = channel.draw_secure_felt();
+        info!("CommitmentSchemeVerifier::verify_values - Channel mixing and random coeff generation took: {:?}", phase_timer.elapsed());
 
+        // Bounds computation
+        let phase_timer = std::time::Instant::now();
         let bounds = self
             .column_log_sizes()
             .flatten()
@@ -74,21 +83,30 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
                 CirclePolyDegreeBound::new(log_size - self.config.fri_config.log_blowup_factor)
             })
             .collect_vec();
+        info!("CommitmentSchemeVerifier::verify_values - Bounds computation took: {:?}, found {} bounds", phase_timer.elapsed(), bounds.len());
 
-        // FRI commitment phase on OODS quotients.
+        // FRI commitment phase on OODS quotients
+        let phase_timer = std::time::Instant::now();
         let mut fri_verifier =
             FriVerifier::<MC>::commit(channel, self.config.fri_config, proof.fri_proof, bounds)?;
+        info!("CommitmentSchemeVerifier::verify_values - FRI commitment phase took: {:?}", phase_timer.elapsed());
 
-        // Verify proof of work.
+        // Verify proof of work
+        let phase_timer = std::time::Instant::now();
         channel.mix_u64(proof.proof_of_work);
         if channel.trailing_zeros() < self.config.pow_bits {
+            info!("CommitmentSchemeVerifier::verify_values - Proof of work verification failed");
             return Err(VerificationError::ProofOfWork);
         }
+        info!("CommitmentSchemeVerifier::verify_values - Proof of work verification took: {:?}", phase_timer.elapsed());
 
-        // Get FRI query positions.
+        // Get FRI query positions
+        let phase_timer = std::time::Instant::now();
         let query_positions_per_log_size = fri_verifier.sample_query_positions(channel);
+        info!("CommitmentSchemeVerifier::verify_values - FRI query positions sampling took: {:?}", phase_timer.elapsed());
 
-        // Verify merkle decommitments.
+        // Verify merkle decommitments
+        let phase_timer = std::time::Instant::now();
         self.trees
             .as_ref()
             .zip_eq(proof.decommitments)
@@ -99,8 +117,10 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
             .0
             .into_iter()
             .collect::<Result<(), _>>()?;
+        info!("CommitmentSchemeVerifier::verify_values - Merkle decommitments verification took: {:?}", phase_timer.elapsed());
 
-        // Answer FRI queries.
+        // Answer FRI queries preparation
+        let phase_timer = std::time::Instant::now();
         let samples = sampled_points.zip_cols(proof.sampled_values).map_cols(
             |(sampled_points, sampled_values)| {
                 zip(sampled_points, sampled_values)
@@ -119,9 +139,14 @@ impl<MC: MerkleChannel> CommitmentSchemeVerifier<MC> {
             proof.queried_values,
             n_columns_per_log_size,
         )?;
+        info!("CommitmentSchemeVerifier::verify_values - FRI answers preparation took: {:?}", phase_timer.elapsed());
 
+        // FRI decommitment
+        let phase_timer = std::time::Instant::now();
         fri_verifier.decommit(fri_answers)?;
+        info!("CommitmentSchemeVerifier::verify_values - FRI decommitment took: {:?}", phase_timer.elapsed());
 
+        info!("CommitmentSchemeVerifier::verify_values - Total verification time: {:?}", total_start.elapsed());
         Ok(())
     }
 }
